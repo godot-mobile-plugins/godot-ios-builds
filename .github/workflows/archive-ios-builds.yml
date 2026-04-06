@@ -1,0 +1,589 @@
+#
+# © 2026-present Godot Mobile Plugins (https://github.com/godot-mobile-plugins)
+#
+
+name: Archive Godot iOS Builds
+
+on:
+  schedule:
+    - cron: '0 4 * * 4' # Every Thursday at 04:00 UTC
+    - cron: '0 4 * * 0' # Every Sunday at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Specific release tag to process (e.g. 4.6.2-rc2).
+          Leave empty to automatically check the latest 10 releases.
+        required: false
+        default: ''
+
+jobs:
+  # -----------------------------------------------------------------------------
+  # Job 1 – Determine which releases need archives built
+  # -----------------------------------------------------------------------------
+  check-releases:
+    name: Check for missing releases
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      # JSON array of tag strings that need to be built, e.g. ["4.6.2-rc2","4.5.2-stable"]
+      missing_tags: ${{ steps.check.outputs.missing_tags }}
+      # JSON array of all evaluated tags (used for the "all present" log message)
+      all_tags: ${{ steps.check.outputs.all_tags }}
+      # "true" when every evaluated tag already has a release in godot-ios-builds
+      all_present: ${{ steps.check.outputs.all_present }}
+      # "single" when the workflow was dispatched with an explicit version,
+      # "batch"  when it ran on schedule / dispatch with no version input
+      mode: ${{ steps.check.outputs.mode }}
+
+    steps:
+      - name: Determine missing releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          MANUAL_VERSION="${{ inputs.version }}"
+
+          if [ -n "$MANUAL_VERSION" ]; then
+            # -- Manual dispatch with an explicit tag --------------------------
+            echo "mode=single" >> "$GITHUB_OUTPUT"
+            ALL_TAGS_JSON=$(jq -cn --arg t "$MANUAL_VERSION" '[$t]')
+            echo "all_tags=$ALL_TAGS_JSON" >> "$GITHUB_OUTPUT"
+
+            if gh release view "$MANUAL_VERSION" \
+                 --repo godot-mobile-plugins/godot-ios-builds \
+                 > /dev/null 2>&1; then
+              echo "Release '$MANUAL_VERSION' already exists in godot-mobile-plugins/godot-ios-builds."
+              echo "missing_tags=[]"  >> "$GITHUB_OUTPUT"
+              echo "all_present=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release '$MANUAL_VERSION' is missing – will build."
+              echo "missing_tags=$ALL_TAGS_JSON" >> "$GITHUB_OUTPUT"
+              echo "all_present=false"            >> "$GITHUB_OUTPUT"
+            fi
+
+          else
+            # -- Scheduled / unversioned dispatch – check latest 10 releases --
+            echo "mode=batch" >> "$GITHUB_OUTPUT"
+
+            echo "Fetching the 10 latest releases from godotengine/godot-builds …"
+            GODOT_TAGS_JSON=$(gh release list \
+              --repo godotengine/godot-builds \
+              --limit 10 \
+              --json tagName \
+              --jq '[.[].tagName]')
+
+            echo "Latest 10 tags: $GODOT_TAGS_JSON"
+            echo "all_tags=$GODOT_TAGS_JSON" >> "$GITHUB_OUTPUT"
+
+            MISSING_JSON="[]"
+            ALL_PRESENT=true
+
+            while IFS= read -r TAG; do
+              echo "Checking '$TAG' in godot-mobile-plugins/godot-ios-builds …"
+              if gh release view "$TAG" \
+                   --repo godot-mobile-plugins/godot-ios-builds \
+                   > /dev/null 2>&1; then
+                echo "  ✔ present"
+              else
+                echo "  ✘ missing – will build"
+                ALL_PRESENT=false
+                MISSING_JSON=$(echo "$MISSING_JSON" | jq -c --arg t "$TAG" '. + [$t]')
+              fi
+            done < <(echo "$GODOT_TAGS_JSON" | jq -r '.[]')
+
+            # -- Sort missing tags: ascending version, then dev < beta < rc < stable --
+            #
+            # Sort key format (all fields zero-padded so plain lexicographic sort works):
+            #   <MAJOR>.<MINOR>.<PATCH>.<FLAVOR_WEIGHT>.<FLAVOR_NUM>
+            #
+            #   FLAVOR_WEIGHT:  1=dev  2=beta  3=rc  4=stable  9=unknown
+            #
+            if [ "$MISSING_JSON" != "[]" ]; then
+              SORT_INPUT=""
+              while IFS= read -r TAG; do
+                VER="${TAG%-*}"
+                FLAVOR="${TAG##*-}"
+
+                IFS='.' read -r -a _V <<< "$VER"
+                MAJOR=$(printf '%04d' "${_V[0]:-0}")
+                MINOR=$(printf '%04d' "${_V[1]:-0}")
+                PATCH=$(printf '%04d' "${_V[2]:-0}")
+
+                if [[ "$FLAVOR" =~ ^dev([0-9]+)$ ]]; then
+                  W=1; N="${BASH_REMATCH[1]}"
+                elif [[ "$FLAVOR" =~ ^beta([0-9]+)$ ]]; then
+                  W=2; N="${BASH_REMATCH[1]}"
+                elif [[ "$FLAVOR" =~ ^rc([0-9]+)$ ]]; then
+                  W=3; N="${BASH_REMATCH[1]}"
+                elif [ "$FLAVOR" = "stable" ]; then
+                  W=4; N=0
+                else
+                  echo "::warning::Unrecognised flavor '$FLAVOR' in tag '$TAG' – it will be processed last."
+                  W=9; N=0
+                fi
+
+                KEY=$(printf '%s.%s.%s.%d.%04d' "$MAJOR" "$MINOR" "$PATCH" "$W" "$N")
+                SORT_INPUT+="${KEY} ${TAG}"$'\n'
+              done < <(echo "$MISSING_JSON" | jq -r '.[]')
+
+              MISSING_JSON=$(
+                printf '%s' "$SORT_INPUT" \
+                  | sort \
+                  | awk 'NF {print $2}' \
+                  | jq -Rcn '[inputs | select(length > 0)]'
+              )
+            fi
+
+            echo "missing_tags=$MISSING_JSON" >> "$GITHUB_OUTPUT"
+
+            if $ALL_PRESENT; then
+              echo "all_present=true"  >> "$GITHUB_OUTPUT"
+            else
+              echo "all_present=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  # -----------------------------------------------------------------------------
+  # Job 2 – Log a summary when every checked release is already present
+  # -----------------------------------------------------------------------------
+  log-all-present:
+    name: Log – all releases present
+    runs-on: ubuntu-latest
+    needs: check-releases
+    if: needs.check-releases.outputs.all_present == 'true'
+
+    steps:
+      - name: Print summary
+        env:
+          ALL_TAGS:  ${{ needs.check-releases.outputs.all_tags }}
+          MODE:      ${{ needs.check-releases.outputs.mode }}
+        run: |
+          if [ "$MODE" = "single" ]; then
+            TAG=$(echo "$ALL_TAGS" | jq -r '.[0]')
+            echo "Release '$TAG' is already present in godot-mobile-plugins/godot-ios-builds. Nothing to do."
+          else
+            echo "All of the latest 10 releases from godotengine/godot-builds are already"
+            echo "present in godot-mobile-plugins/godot-ios-builds."
+            echo ""
+            echo "Present tags:"
+            echo "$ALL_TAGS" | jq -r '.[] | "  - " + .'
+          fi
+
+  # -----------------------------------------------------------------------------
+  # Job 3 – Build all archives for every missing release
+  #
+  # Each matrix entry is one tag (e.g. "4.6.2-rc2").  The tag is split into
+  # <version> (e.g. "4.6.2") and <flavor> (e.g. "rc2") before being passed to
+  # the ActionCommons/build-godot action.
+  #
+  # Ordering guarantee: missing_tags is already sorted ascending by version and
+  # flavor (dev < beta < rc < stable) by check-releases.  GitHub Actions
+  # schedules matrix slots in array order when max-parallel: 1 is set, so
+  # releases are created in that sorted order, one at a time.
+  #
+  # Per-release steps:
+  #    1. Parse tag → version + flavor
+  #    2. Checkout godot-ios-builds repository
+  #    3. Build the header archive via ActionCommons/build-godot
+  #    4. Rename the archive to godot-ios-builds-<version>-<flavor>.zip
+  #    5. Build iOS Device Debug  → libgodot.ios.template_debug.arm64.a
+  #    6. Archive device debug    → godot-ios-device-debug-<version>-<flavor>.zip
+  #    7. Build iOS Device Release → libgodot.ios.template_release.arm64.a
+  #    8. Archive device release  → godot-ios-device-release-<version>-<flavor>.zip
+  #    9. Build iOS Simulator Debug → libgodot.ios.template_debug.arm64.simulator.a
+  #   10. Archive simulator debug  → godot-ios-simulator-debug-<version>-<flavor>.zip
+  #   11. Build iOS Simulator Release → libgodot.ios.template_release.arm64.simulator.a
+  #   12. Archive simulator release   → godot-ios-simulator-release-<version>-<flavor>.zip
+  #   13. Count .h files and write releases/<version>-<flavor>.json
+  #   14. Commit the JSON, push it, and create the git tag on that commit
+  #   15. Create the GitHub release and attach all five archives
+  # -----------------------------------------------------------------------------
+  build-headers:
+    name: Build archives – ${{ matrix.tag }}
+    runs-on: macos-latest
+    needs: check-releases
+    if: >
+      needs.check-releases.outputs.all_present == 'false' &&
+      needs.check-releases.outputs.missing_tags != '[]'
+
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.check-releases.outputs.missing_tags) }}
+      max-parallel: 1
+      fail-fast: false
+
+    steps:
+      # -- 1. Parse the tag into version + flavor ------------------------------
+      #
+      # Tag format:  <semver>-<flavor>
+      # Examples:
+      #   4.6.2-rc2    → version=4.6.2   flavor=rc2
+      #   4.5.2-stable → version=4.5.2   flavor=stable
+      #   4.7-dev3     → version=4.7     flavor=dev3
+      #
+      - name: Parse version and flavor from tag
+        id: parse
+        shell: bash
+        run: |
+          TAG="${{ matrix.tag }}"
+
+          # Everything before the last hyphen is the version number.
+          VERSION="${TAG%-*}"
+          # Everything after the last hyphen is the flavor.
+          FLAVOR="${TAG##*-}"
+
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "flavor=$FLAVOR"   >> "$GITHUB_OUTPUT"
+
+          echo "Tag:     $TAG"
+          echo "Version: $VERSION"
+          echo "Flavor:  $FLAVOR"
+
+      # -- 2. Checkout the godot-ios-builds repository ----------------------------
+      #
+      # Checked out into ./godot-ios-builds-repo to avoid colliding with the Godot
+      # source tree written to ./custom_godot_source by the build action.
+      # actions/checkout pre-configures origin with the GITHUB_TOKEN, so later
+      # git push commands work without extra credential setup.
+      #
+      - name: Checkout godot-ios-builds repository
+        uses: actions/checkout@v6
+        with:
+          path: godot-ios-builds-repo
+
+      # -- 3. Build the header archive ------------------------------------------
+      - name: Build Godot headers (${{ matrix.tag }})
+        id: godot
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_release
+          directory:    './custom_godot_source'
+          timeout:      '120' # 2 minutes should be enough to generate all headers (GitHub environment can be slow)
+          options:      'create_header_archive'
+
+      # -- 4. Rename the header archive ----------------------------------------
+      #
+      # Output file name format:  godot-headers-<version>-<flavor>.zip
+      # Examples:
+      #   godot-headers-4.6.2-rc2.zip
+      #   godot-headers-4.5.2-stable.zip
+      #   godot-headers-4.7-dev3.zip
+      #
+      - name: Rename header archive (${{ matrix.tag }})
+        id: rename
+        shell: bash
+        run: |
+          SRC="${{ steps.godot.outputs.header_archive }}"
+          DEST="godot-headers-${{ steps.parse.outputs.version }}-${{ steps.parse.outputs.flavor }}.zip"
+
+          mv "$SRC" "$DEST"
+          echo "header_archive=$DEST" >> "$GITHUB_OUTPUT"
+
+          echo "Renamed: $SRC → $DEST"
+
+      # -- 5. Build iOS Device Debug --------------------------------------------
+      - name: Build iOS Device Debug (${{ matrix.tag }})
+        id: godot_device_debug
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_debug
+          directory:    './custom_godot_source'
+
+      # -- 6. Archive iOS Device Debug library ----------------------------------
+      #
+      # Output file name format:  godot-ios-device-debug-<version>-<flavor>.zip
+      # Example:                  godot-ios-device-debug-4.6.2-stable.zip
+      #
+      - name: Archive iOS Device Debug (${{ matrix.tag }})
+        id: archive_device_debug
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          DEST="godot-ios-device-debug-${VERSION}-${FLAVOR}.zip"
+          FILE_NAME="libgodot.ios.template_debug.arm64.a"
+
+          LIB_PATH=$(find ./custom_godot_source -name "$FILE_NAME" 2>/dev/null | head -1)
+
+          if [ -z "$LIB_PATH" ]; then
+            echo "::error::$FILE_NAME not found under ./custom_godot_source"
+            echo "Tree (3 levels):"
+            find ./custom_godot_source -maxdepth 3 | sort
+            exit 1
+          fi
+
+          echo "Found: $LIB_PATH"
+          RELATIVE="${LIB_PATH#./custom_godot_source/}"
+          cd ./custom_godot_source
+          zip "../${DEST}" "$RELATIVE"
+          cd ..
+
+          echo "device_debug_archive=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Archived: $DEST"
+
+      # -- 7. Build iOS Device Release ------------------------------------------
+      - name: Build iOS Device Release (${{ matrix.tag }})
+        id: godot_device_release
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_release
+          directory:    './custom_godot_source'
+
+      # -- 8. Archive iOS Device Release library --------------------------------
+      #
+      # Output file name format:  godot-ios-device-release-<version>-<flavor>.zip
+      # Example:                  godot-ios-device-release-4.6.2-stable.zip
+      #
+      - name: Archive iOS Device Release (${{ matrix.tag }})
+        id: archive_device_release
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          DEST="godot-ios-device-release-${VERSION}-${FLAVOR}.zip"
+          FILE_NAME="libgodot.ios.template_release.arm64.a"
+
+          LIB_PATH=$(find ./custom_godot_source -name "$FILE_NAME" 2>/dev/null | head -1)
+
+          if [ -z "$LIB_PATH" ]; then
+            echo "::error::$FILE_NAME not found under ./custom_godot_source"
+            echo "Tree (3 levels):"
+            find ./custom_godot_source -maxdepth 3 | sort
+            exit 1
+          fi
+
+          echo "Found: $LIB_PATH"
+          RELATIVE="${LIB_PATH#./custom_godot_source/}"
+          cd ./custom_godot_source
+          zip "../${DEST}" "$RELATIVE"
+          cd ..
+
+          echo "device_release_archive=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Archived: $DEST"
+
+      # -- 9. Build iOS Simulator Debug -----------------------------------------
+      - name: Build iOS Simulator Debug (${{ matrix.tag }})
+        id: godot_simulator_debug
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_debug
+          directory:    './custom_godot_source'
+          options:      'ios_simulator=yes'
+
+      # -- 10. Archive iOS Simulator Debug library -------------------------------
+      #
+      # Output file name format:  godot-ios-simulator-debug-<version>-<flavor>.zip
+      # Example:                  godot-ios-simulator-debug-4.6.2-stable.zip
+      #
+      - name: Archive iOS Simulator Debug (${{ matrix.tag }})
+        id: archive_simulator_debug
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          DEST="godot-ios-simulator-debug-${VERSION}-${FLAVOR}.zip"
+          FILE_NAME="libgodot.ios.template_debug.arm64.simulator.a"
+
+          LIB_PATH=$(find ./custom_godot_source -name "$FILE_NAME" 2>/dev/null | head -1)
+
+          if [ -z "$LIB_PATH" ]; then
+            echo "::error::$FILE_NAME not found under ./custom_godot_source"
+            echo "Tree (3 levels):"
+            find ./custom_godot_source -maxdepth 3 | sort
+            exit 1
+          fi
+
+          echo "Found: $LIB_PATH"
+          RELATIVE="${LIB_PATH#./custom_godot_source/}"
+          cd ./custom_godot_source
+          zip "../${DEST}" "$RELATIVE"
+          cd ..
+
+          echo "simulator_debug_archive=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Archived: $DEST"
+
+      # -- 11. Build iOS Simulator Release --------------------------------------
+      - name: Build iOS Simulator Release (${{ matrix.tag }})
+        id: godot_simulator_release
+        uses: ActionCommons/build-godot@v1
+        with:
+          version:      ${{ steps.parse.outputs.version }}
+          flavor:       ${{ steps.parse.outputs.flavor }}
+          platform:     ios
+          target:       template_release
+          directory:    './custom_godot_source'
+          options:      'ios_simulator=yes'
+
+      # -- 12. Archive iOS Simulator Release library -----------------------------
+      #
+      # Output file name format:  godot-ios-simulator-release-<version>-<flavor>.zip
+      # Example:                  godot-ios-simulator-release-4.6.2-stable.zip
+      #
+      - name: Archive iOS Simulator Release (${{ matrix.tag }})
+        id: archive_simulator_release
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          DEST="godot-ios-simulator-release-${VERSION}-${FLAVOR}.zip"
+          FILE_NAME="libgodot.ios.template_release.arm64.simulator.a"
+
+          LIB_PATH=$(find ./custom_godot_source -name "$FILE_NAME" 2>/dev/null | head -1)
+
+          if [ -z "$LIB_PATH" ]; then
+            echo "::error::$FILE_NAME not found under ./custom_godot_source"
+            echo "Tree (3 levels):"
+            find ./custom_godot_source -maxdepth 3 | sort
+            exit 1
+          fi
+
+          echo "Found: $LIB_PATH"
+          RELATIVE="${LIB_PATH#./custom_godot_source/}"
+          cd ./custom_godot_source
+          zip "../${DEST}" "$RELATIVE"
+          cd ..
+
+          echo "simulator_release_archive=$DEST" >> "$GITHUB_OUTPUT"
+          echo "Archived: $DEST"
+
+      # -- 14. Generate the JSON description file ------------------------------
+      #
+      # Counts every .h file inside the renamed archive using zipinfo (-Z1 lists
+      # one filename per line) and writes releases/<version>-<flavor>.json into
+      # the checked-out repository tree.
+      #
+      # JSON schema:
+      #   {
+      #     "version":          "<semver>",   e.g. "4.6.2"
+      #     "flavor":           "<flavor>",   e.g. "stable"
+      #     "num_header_files": <integer>
+      #   }
+      #
+      - name: Generate JSON description (${{ matrix.tag }})
+        id: json
+        shell: bash
+        run: |
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+          HEADER_ARCHIVE="${{ steps.rename.outputs.header_archive }}"
+
+          NUM_HEADERS=$(unzip -Z1 "$HEADER_ARCHIVE" | grep -c '\.h$' || echo 0)
+
+          mkdir -p godot-ios-builds-repo/releases
+          jq -n \
+            --arg  version "$VERSION" \
+            --arg  flavor  "$FLAVOR"  \
+            --argjson num  "$NUM_HEADERS" \
+            '{version: $version, flavor: $flavor, num_header_files: $num}' \
+            > "godot-ios-builds-repo/releases/${VERSION}-${FLAVOR}.json"
+
+          echo "num_header_files=$NUM_HEADERS"               >> "$GITHUB_OUTPUT"
+          echo "json_path=releases/${VERSION}-${FLAVOR}.json" >> "$GITHUB_OUTPUT"
+          echo "Wrote godot-ios-builds-repo/releases/${VERSION}-${FLAVOR}.json (num_header_files=$NUM_HEADERS)"
+
+      # -- 15. Commit the JSON file and push the release tag -------------------
+      #
+      # Each matrix job checks out the repo at step 2, but the build (step 3)
+      # takes ~60 minutes.  By the time this step runs, an earlier matrix job
+      # may have pushed new commits, leaving this clone behind.  The rebase pull
+      # brings the local branch up to date before committing, preventing the
+      # "fetch first" rejection seen on all jobs after the first.
+      #
+      # The JSON file written in step 14 sits outside the index at this point, so
+      # it is unaffected by the rebase.
+      #
+      # The git tag must be pushed before gh release create (step 16) is called;
+      # otherwise GitHub creates a dangling lightweight tag instead of attaching
+      # the release to the commit that contains the JSON file.
+      #
+      - name: Commit JSON description and tag (${{ matrix.tag }})
+        shell: bash
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          VERSION="${{ steps.parse.outputs.version }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
+
+          cd godot-ios-builds-repo
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin HEAD
+
+          git add "releases/${VERSION}-${FLAVOR}.json"
+          git commit -m "Add release description for ${TAG}"
+          git push origin HEAD
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          echo "✔ Committed releases/${VERSION}-${FLAVOR}.json and pushed tag '$TAG'."
+
+      # -- 16. Create the GitHub release and attach all archives ----------------
+      #
+      # The tag already exists on the repository (pushed in step 15), so
+      # gh release create attaches the release to that commit rather than
+      # creating a new dangling tag.
+      #
+      # Five ZIP archives are attached:
+      #   • godot-ios-builds-<version>-<flavor>.zip              — C/C++ headers
+      #   • godot-ios-device-debug-<version>-<flavor>.zip     — device debug static library
+      #   • godot-ios-device-release-<version>-<flavor>.zip   — device release static library
+      #   • godot-ios-simulator-debug-<version>-<flavor>.zip  — simulator debug static library
+      #   • godot-ios-simulator-release-<version>-<flavor>.zip — simulator release static library
+      #
+      - name: Create release and upload archives (${{ matrix.tag }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ steps.parse.outputs.tag }}"
+          HEADER_ARCHIVE="${{ steps.rename.outputs.header_archive }}"
+          DEVICE_DEBUG_ARCHIVE="${{ steps.archive_device_debug.outputs.device_debug_archive }}"
+          DEVICE_RELEASE_ARCHIVE="${{ steps.archive_device_release.outputs.device_release_archive }}"
+          SIMULATOR_DEBUG_ARCHIVE="${{ steps.archive_simulator_debug.outputs.simulator_debug_archive }}"
+          SIMULATOR_RELEASE_ARCHIVE="${{ steps.archive_simulator_release.outputs.simulator_release_archive }}"
+
+          RELEASE_BODY="This release contains build artifacts from the [$TAG](https://github.com/godotengine/godot-builds/releases/tag/$TAG) Godot Release.
+
+          **Included archives:**
+
+          - \`${HEADER_ARCHIVE}\` — Static and generated C/C++ header files from an iOS build.
+          - \`${DEVICE_DEBUG_ARCHIVE}\` — Static library (\`libgodot.ios.template_debug.arm64.a\`) for iOS device debug builds.
+          - \`${DEVICE_RELEASE_ARCHIVE}\` — Static library (\`libgodot.ios.template_release.arm64.a\`) for iOS device release builds.
+          - \`${SIMULATOR_DEBUG_ARCHIVE}\` — Static library (\`libgodot.ios.template_debug.arm64.simulator.a\`) for iOS simulator debug builds.
+          - \`${SIMULATOR_RELEASE_ARCHIVE}\` — Static library (\`libgodot.ios.template_release.arm64.simulator.a\`) for iOS simulator release builds."
+
+          echo "Creating release '$TAG' in godot-mobile-plugins/godot-ios-builds …"
+          gh release create "$TAG" \
+            --repo  godot-mobile-plugins/godot-ios-builds \
+            --title "$TAG" \
+            --notes "$RELEASE_BODY" \
+            "$HEADER_ARCHIVE" \
+            "$DEVICE_DEBUG_ARCHIVE" \
+            "$DEVICE_RELEASE_ARCHIVE" \
+            "$SIMULATOR_DEBUG_ARCHIVE" \
+            "$SIMULATOR_RELEASE_ARCHIVE"
+
+          echo "✔ Release '$TAG' created and all archives uploaded."
