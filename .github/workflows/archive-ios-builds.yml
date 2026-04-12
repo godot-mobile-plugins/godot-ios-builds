@@ -6,8 +6,9 @@ name: Archive Godot iOS Builds
 
 on:
   schedule:
-    - cron: '0 4 * * 4' # Every Thursday at 04:00 UTC
-    - cron: '0 4 * * 0' # Every Sunday at 04:00 UTC
+    - cron: '0 3 * * 2' # Every Tuesday at 03:00 UTC
+    - cron: '0 3 * * 4' # Every Thursday at 03:00 UTC
+    - cron: '0 3 * * 6' # Every Saturday at 03:00 UTC
   workflow_dispatch:
     inputs:
       version:
@@ -188,18 +189,18 @@ jobs:
   # releases are created in that sorted order, one at a time.
   #
   # Per-release steps:
-  #    1. Parse tag → version + flavor
+  #    1. Parse tag -> version + flavor
   #    2. Checkout godot-ios-builds repository
   #    3. Build the header archive via ActionCommons/build-godot
   #    4. Rename the archive to godot-ios-builds-<version>-<flavor>.zip
-  #    5. Build iOS Device Debug  → libgodot.ios.template_debug.arm64.a
-  #    6. Archive device debug    → godot-ios-device-debug-<version>-<flavor>.zip
-  #    7. Build iOS Device Release → libgodot.ios.template_release.arm64.a
-  #    8. Archive device release  → godot-ios-device-release-<version>-<flavor>.zip
-  #    9. Build iOS Simulator Debug → libgodot.ios.template_debug.arm64.simulator.a
-  #   10. Archive simulator debug  → godot-ios-simulator-debug-<version>-<flavor>.zip
-  #   11. Build iOS Simulator Release → libgodot.ios.template_release.arm64.simulator.a
-  #   12. Archive simulator release   → godot-ios-simulator-release-<version>-<flavor>.zip
+  #    5. Build iOS Device Debug  -> libgodot.ios.template_debug.arm64.a
+  #    6. Archive device debug    -> godot-ios-device-debug-<version>-<flavor>.zip
+  #    7. Build iOS Device Release -> libgodot.ios.template_release.arm64.a
+  #    8. Archive device release  -> godot-ios-device-release-<version>-<flavor>.zip
+  #    9. Build iOS Simulator Debug -> libgodot.ios.template_debug.arm64.simulator.a
+  #   10. Archive simulator debug  -> godot-ios-simulator-debug-<version>-<flavor>.zip
+  #   11. Build iOS Simulator Release -> libgodot.ios.template_release.arm64.simulator.a
+  #   12. Archive simulator release   -> godot-ios-simulator-release-<version>-<flavor>.zip
   #   13. Count .h files and write releases/<version>-<flavor>.json
   #   14. Commit the JSON, push it, and create the git tag on that commit
   #   15. Create the GitHub release and attach all five archives
@@ -226,9 +227,9 @@ jobs:
       #
       # Tag format:  <semver>-<flavor>
       # Examples:
-      #   4.6.2-rc2    → version=4.6.2   flavor=rc2
-      #   4.5.2-stable → version=4.5.2   flavor=stable
-      #   4.7-dev3     → version=4.7     flavor=dev3
+      #   4.6.2-rc2    -> version=4.6.2   flavor=rc2
+      #   4.5.2-stable -> version=4.5.2   flavor=stable
+      #   4.7-dev3     -> version=4.7     flavor=dev3
       #
       - name: Parse version and flavor from tag
         id: parse
@@ -292,7 +293,7 @@ jobs:
           mv "$SRC" "$DEST"
           echo "header_archive=$DEST" >> "$GITHUB_OUTPUT"
 
-          echo "Renamed: $SRC → $DEST"
+          echo "Renamed: $SRC -> $DEST"
 
       # -- 5. Build iOS Device Debug --------------------------------------------
       - name: Build iOS Device Debug (${{ matrix.tag }})
@@ -575,11 +576,19 @@ jobs:
           - \`${SIMULATOR_DEBUG_ARCHIVE}\` — Static library (\`libgodot.ios.template_debug.arm64.simulator.a\`) for iOS simulator debug builds.
           - \`${SIMULATOR_RELEASE_ARCHIVE}\` — Static library (\`libgodot.ios.template_release.arm64.simulator.a\`) for iOS simulator release builds."
 
+          # Mark every flavor other than "stable" as a pre-release
+          # (e.g. dev1, dev2, beta1, rc2, rc5 are all pre-releases).
+          PRERELEASE_FLAG=""
+          if [ "$FLAVOR" != "stable" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
           echo "Creating release '$TAG' in godot-mobile-plugins/godot-ios-builds …"
           gh release create "$TAG" \
             --repo  godot-mobile-plugins/godot-ios-builds \
             --title "$TAG" \
             --notes "$RELEASE_BODY" \
+            $PRERELEASE_FLAG \
             "$HEADER_ARCHIVE" \
             "$DEVICE_DEBUG_ARCHIVE" \
             "$DEVICE_RELEASE_ARCHIVE" \
