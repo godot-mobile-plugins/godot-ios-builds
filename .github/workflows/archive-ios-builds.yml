@@ -258,7 +258,7 @@ jobs:
       # git push commands work without extra credential setup.
       #
       - name: Checkout godot-ios-builds repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           path: godot-ios-builds-repo
 
@@ -560,6 +560,7 @@ jobs:
         shell: bash
         run: |
           TAG="${{ steps.parse.outputs.tag }}"
+          FLAVOR="${{ steps.parse.outputs.flavor }}"
           HEADER_ARCHIVE="${{ steps.rename.outputs.header_archive }}"
           DEVICE_DEBUG_ARCHIVE="${{ steps.archive_device_debug.outputs.device_debug_archive }}"
           DEVICE_RELEASE_ARCHIVE="${{ steps.archive_device_release.outputs.device_release_archive }}"
